@@ -578,7 +578,7 @@
     <div class="apptitle">
       <b>Lanchat</b>
       <span class="dev" id="devName"></span>
-      <span class="vchip" id="verChat" title="程序版本号">v3.2</span>
+      <span class="vchip" id="verChat" title="程序版本号">v3.3</span>
     </div>
     <div class="chatstat">
       <span class="dot" id="onlineDot"></span>
@@ -924,7 +924,7 @@
      每次改动都要：① 递增 APP_VERSION ② 更新 APP_DATE
      ③ 程序文件夹同步改名（如 lanchat_v1.7）
      ④ 在 更新日志.txt 里记一条。详见 更新日志.txt 顶部规则。 */
-  var APP_VERSION = '3.2';
+  var APP_VERSION = '3.3';
   var APP_DATE = '2026-10-26';
 
   /* ===================== 基础工具 ===================== */
@@ -1110,7 +1110,8 @@
     busy: false, timer: null, ptimer: null,
     lastPeerScan: 0, atBottom: true, lastMsg: null,
     where: null,            // 共享文件夹的地址（/api/where：root / unc / kind）
-    streaming: []           // v3.1：还在流式输出中的 AI 消息（要一直重读到收尾）
+    streaming: [],          // v3.1：还在流式输出中的 AI 消息（要一直重读到收尾）
+    childOf: {}             // v3.3：被回复消息 id -> [回复它的消息]，排序纠偏用
   };
 
   /* ===================== 内存版目录（演示 / 自检用） ===================== */
@@ -1255,6 +1256,7 @@
 
       S.msgs = new Map(); S.order = []; S.seen = new Set();
       S.blobCache = new Map(); S.pending = []; S.buffer = []; S.streaming = [];
+      S.childOf = {}; S.tickN = 0; S.lastWriteTs = 0;
       S.initial = true; S.atBottom = true; S.lastMsg = null;
       /* v3.2：换文件夹要重置的东西（消息水位、文件页路径、变动通知序号） */
       MSG_WATER = 0; S.hasMore = false; S.loadingMore = false;
@@ -1943,7 +1945,11 @@
     if (!S.dir || S.busy) return;
     S.busy = true;
     try {
-      await scanMsgs();
+      /* v3.3：每 10 轮（约 4 秒）把尾巴完整重扫一遍。
+         别的机器的时钟可能比本机慢，它写的新消息 ts 比水位线还小，
+         只靠 after= 会永远拉不到。40 条的小批量，代价很低。 */
+      S.tickN = (S.tickN || 0) + 1;
+      await scanMsgs(S.tickN % 10 === 0);
       await updateStreaming();
       if (Date.now() - S.lastPeerScan > 1500) { S.lastPeerScan = Date.now(); await scanPeers(); }
       if (Date.now() - S.lastWatch > 2000) { S.lastWatch = Date.now(); await pollWatch(); }
@@ -1955,9 +1961,9 @@
     }
   }
 
-  async function scanMsgs() {
+  async function scanMsgs(probe) {
     /* 原生版走批量接口：一次请求拿一页，不再「列目录 + 每条一个 /api/read」 */
-    if (NATIVE && S.msgsDir && S.msgsDir.abs) return scanMsgsPage();
+    if (NATIVE && S.msgsDir && S.msgsDir.abs) return scanMsgsPage(probe);
     var names = [];
     for await (var entry of S.msgsDir.entries()) {
       var name = entry[0], h = entry[1];
@@ -1970,10 +1976,12 @@
     for (var i = 0; i < names.length; i++) {
       var fn = names[i];
       S.seen.add(fn);
-      var fh, txt;
+      var fh, txt, mt = 0;
       try {
         fh = await S.msgsDir.getFileHandle(fn);
-        txt = await (await fh.getFile()).text();
+        var ff = await fh.getFile();
+        mt = ff.lastModified || 0;
+        txt = await ff.text();
       } catch (e) { S.seen.delete(fn); continue; }
       var m = null;
       try { m = JSON.parse(txt); } catch (e) { S.seen.delete(fn); continue; }
@@ -1982,6 +1990,7 @@
       if (!m || !m.id || !m.ts) continue;
       if (S.msgs.has(m.id)) continue;
       m.__fn = fn;
+      m.__mt = mt;
       ingest(m);
     }
     if (S.initial) finishInitial();
@@ -1992,9 +2001,10 @@
      往上滚到底再往前翻一页 —— 老消息不会一次全读进内存。 */
   var MSG_WATER = 0;
 
-  async function scanMsgsPage() {
-    var q = '/api/msgs?path=' + encodeURIComponent(S.msgsDir.abs) + '&limit=400';
-    if (!S.initial && MSG_WATER) q += '&after=' + MSG_WATER;
+  async function scanMsgsPage(probe) {
+    var q = '/api/msgs?path=' + encodeURIComponent(S.msgsDir.abs) +
+      '&limit=' + (probe ? 40 : 400);
+    if (!probe && !S.initial && MSG_WATER) q += '&after=' + MSG_WATER;
     var r;
     try { r = await napi(q); } catch (e) { if (S.initial) finishInitial(); return; }
     var items = r.items || [];
@@ -2008,6 +2018,7 @@
       if (m.ts > MSG_WATER) MSG_WATER = m.ts;
       if (S.msgs.has(m.id)) continue;
       m.__fn = fn;
+      m.__mt = items[i].mt || 0;
       ingest(m);
     }
     if (S.initial) {
@@ -2022,11 +2033,13 @@
     var list = $('list');
     var h0 = list.scrollHeight;
     try {
+      /* 用最早那条的「文件名时间前缀」当游标，比用内容 ts 准（文件名才是真正的分页键） */
+      var cur = S.order[0].__fn ? S.order[0].__fn.slice(0, 13) : S.order[0].ts;
       var r = await napi('/api/msgs?path=' + encodeURIComponent(S.msgsDir.abs) +
-        '&before=' + S.order[0].ts + '&limit=200');
+        '&before=' + cur + '&limit=200');
       var items = r.items || [];
       S.hasMore = !!r.hasMore;
-      var rows = [], frag = document.createDocumentFragment();
+      var rows = [];
       for (var i = 0; i < items.length; i++) {
         var fn = items[i].fn, m = items[i].m;
         if (S.seen.has(fn)) continue;
@@ -2035,11 +2048,15 @@
         if (m && m.del) { dropMsg(m.del); continue; }
         if (!m || !m.id || !m.ts || S.msgs.has(m.id)) continue;
         m.__fn = fn;
+        m.__mt = items[i].mt || 0;
         S.msgs.set(m.id, m);
+        noteChild(m);
         rows.push(m);
-        frag.appendChild(buildMsg(m));
       }
       if (!rows.length) { S.hasMore = false; return; }
+      rows.sort(byOrd);
+      var frag = document.createDocumentFragment();
+      for (var k = 0; k < rows.length; k++) frag.appendChild(buildMsg(rows[k]));
       S.order = rows.concat(S.order);
       list.insertBefore(frag, list.firstChild);
       list.scrollTop += list.scrollHeight - h0;   // 保持在原来看到的位置
@@ -2052,11 +2069,22 @@
 
   function ingest(m) {
     S.msgs.set(m.id, m);
+    noteChild(m);
     if (S.initial) { S.buffer.push(m); return; }
     insertMsg(m);
+    reflowChildren(m.id);
     /* v3.1：AI 的流式回复落盘时带 pending:true，之后会被反复改写。
        盯住它，内容一变就把气泡里的字换掉，做出打字机效果。 */
     if (m.bot && m.pending && m.__fn) S.streaming.push(m);
+  }
+
+  /* v3.3：记下「谁回复了谁」，父消息晚到时要把子消息重新归位 */
+  function noteChild(m) {
+    if (!m || !m.re || m.re === m.id) return;
+    var arr = S.childOf[m.re];
+    if (!arr) { arr = S.childOf[m.re] = []; }
+    for (var i = 0; i < arr.length; i++) if (arr[i] === m) return;
+    arr.push(m);
   }
 
   /* 把流式消息的最新内容刷到气泡上（不动 DOM 结构，只换文字） */
@@ -2097,10 +2125,67 @@
     S.streaming = keep;
   }
 
+  /* ===== v3.3：按「因果 + 文件时间」纠正排序 =====
+     共享文件夹里每台机器各写各的消息，各用自己的系统时钟。
+     机器人在另一台电脑上跑，那台机器慢几百毫秒是常态，
+     于是 AI 回复的 ts 比它回复的那条提问还小，气泡就排到提问前面。
+     两把保险：
+       ① 文件 mtime 由共享文件夹所在的机器统一赋值，跟写入方时钟无关，
+          是「到达顺序」最忠实的来源，优先用它当排序键；
+       ② 再按 re 关系兜一层：一条消息永远排在它所回复的那条之后。
+     只改排序键 __ord，不动 m.ts —— 气泡上显示的时间还是各机原本的时间。 */
+  function ordOf(m) {
+    if (!m) return 0;
+    if (typeof m.__ord === 'number') return m.__ord;
+    m.__ord = (m.__mt && m.__mt > 0) ? m.__mt : (m.ts || 0);
+    if (m.re && m.re !== m.id && !m.__ordBusy) {
+      var p = S.msgs.get(m.re);
+      if (p && p !== m) {
+        m.__ordBusy = true;
+        var po = ordOf(p);
+        m.__ordBusy = false;
+        if (po >= m.__ord) m.__ord = po + 1;
+      }
+    }
+    return m.__ord;
+  }
+  /* 时间相同就用 id 兜底，保证两次渲染顺序完全一致，不会来回抖 */
+  function byOrd(a, b) {
+    var d = ordOf(a) - ordOf(b);
+    return d || String(a.id).localeCompare(String(b.id));
+  }
+
+  /* 父消息比子消息晚到（文件名字典序导致的），父到了就把等在旁边的子消息挪到它后面 */
+  function reflowChildren(pid) {
+    var kids = S.childOf[pid];
+    if (!kids || !kids.length) return;
+    if (!S.msgs.get(pid)) return;
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (S.order.indexOf(k) < 0) { k.__ord = undefined; continue; }  // 还在 buffer 里，排序时自会带上
+      var old = ordOf(k);
+      k.__ord = undefined;
+      if (ordOf(k) !== old) relocateMsg(k);
+    }
+  }
+
+  /* 把已经渲染出来的一条消息挪到它该在的位置（不滚动、不提示） */
+  function relocateMsg(m) {
+    var rows = $('list').querySelectorAll('.msg');
+    var row = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute('data-id') === m.id) { row = rows[i]; break; }
+    }
+    var oi = S.order.indexOf(m);
+    if (oi >= 0) S.order.splice(oi, 1);
+    if (row && row.parentNode) row.parentNode.removeChild(row);
+    insertMsg(m, true);
+  }
+
   function finishInitial() {
     if (!S.initial) return;
     S.initial = false;
-    S.buffer.sort(function (a, b) { return a.ts - b.ts; });
+    S.buffer.sort(byOrd);
     var start = Math.max(0, S.buffer.length - 400);
     for (var i = start; i < S.buffer.length; i++) {
       S.order.push(S.buffer[i]);
@@ -2111,21 +2196,32 @@
     if (S.order.length) S.lastMsg = S.order[S.order.length - 1];
   }
 
-  function insertMsg(m) {
+  function insertMsg(m, quiet) {
     var list = $('list');
     var wasBottom = nearBottom();
-    // 按时间插入到正确位置（正常情况就是末尾）
+    // 按排序键插到正确位置（正常情况就是末尾）；同键的排在已有之后，保持到达顺序
+    var key = ordOf(m);
     var idx = S.order.length;
-    while (idx > 0 && S.order[idx - 1].ts > m.ts) idx--;
+    while (idx > 0 && ordOf(S.order[idx - 1]) > key) idx--;
     if (idx === S.order.length) {
       S.order.push(m);
       list.appendChild(buildMsg(m));
     } else {
       S.order.splice(idx, 0, m);
-      var ref = list.children[idx] || null;
+      /* 参考点是「排在 m 后面的那条」的 DOM 节点。
+         不能用 list.children[idx]：发送进度条也是 #list 的子节点，会错位。 */
+      var nextId = S.order[idx + 1] ? S.order[idx + 1].id : null;
+      var ref = null;
+      if (nextId) {
+        var kids = list.children;
+        for (var i = 0; i < kids.length; i++) {
+          if (kids[i].getAttribute && kids[i].getAttribute('data-id') === nextId) { ref = kids[i]; break; }
+        }
+      }
       list.insertBefore(buildMsg(m), ref);
     }
     S.lastMsg = m;
+    if (quiet) return;
     if (wasBottom || isMine(m)) scrollToBottom();
     else showNewTip();
   }
@@ -2180,12 +2276,18 @@
 
   /* ===================== 写文件 ===================== */
   async function writeMsg(m) {
+    /* v3.3：本机时钟被系统校时往回拨时，自己连着发的两条会拿到同样的 ts，
+       文件名又只靠后面的随机串区分，顺序就成了「看运气」。
+       自己写的永远比上一条晚 1 毫秒。 */
+    if (S.lastWriteTs && m.ts <= S.lastWriteTs) m.ts = S.lastWriteTs + 1;
+    S.lastWriteTs = m.ts;
     var fn = pad(m.ts, 13) + '-' + Math.random().toString(16).slice(2, 8) + '.json';
     var fh = await S.msgsDir.getFileHandle(fn, { create: true });
     var w = await fh.createWritable();
     await w.write(JSON.stringify(m));
     await w.close();
     m.__fn = fn;      // 记住自己落在哪个文件里，删除单条消息时要用
+    m.__mt = m.ts;    // 本机写、本机赋值 mtime，与 ts 同源，直接用
     S.seen.add(fn);
   }
 
@@ -2205,9 +2307,11 @@
 
   function ingestLocal(m) {
     if (S.msgs.has(m.id)) return;
+    noteChild(m);
     if (S.initial) { S.buffer.push(m); S.msgs.set(m.id, m); return; }
     S.msgs.set(m.id, m);
     insertMsg(m);
+    reflowChildren(m.id);
     scrollToBottom(true);
   }
 
@@ -2700,7 +2804,13 @@
      老版本看到没有 id 的记录会直接跳过，不影响兼容。 */
   function dropMsg(id) {
     if (!id) return;
+    var gone = S.msgs.get(id);
     S.msgs.delete(id);
+    if (gone && gone.re && S.childOf[gone.re]) {
+      var cs = S.childOf[gone.re];
+      for (var c = cs.length - 1; c >= 0; c--) if (cs[c].id === id) cs.splice(c, 1);
+    }
+    delete S.childOf[id];
     for (var i = S.order.length - 1; i >= 0; i--) { if (S.order[i].id === id) S.order.splice(i, 1); }
     for (var j = S.buffer.length - 1; j >= 0; j--) { if (S.buffer[j].id === id) S.buffer.splice(j, 1); }
     var rows = $('list').querySelectorAll('.msg');

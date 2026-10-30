@@ -28,6 +28,7 @@ const msgsPageMax = 800
 
 type msgFile struct {
 	Fn string          `json:"fn"`
+	Mt int64           `json:"mt"` // 文件 mtime（毫秒）：共享文件夹所在机器统一赋值，比消息里的 ts 可靠
 	M  json.RawMessage `json:"m"`
 }
 
@@ -52,12 +53,14 @@ func handleMsgs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	names := make([]string, 0, len(des))
+	ents := make(map[string]os.DirEntry, len(des))
 	for _, de := range des {
 		n := de.Name()
 		if de.IsDir() || !strings.HasSuffix(n, ".json") {
 			continue
 		}
 		names = append(names, n)
+		ents[n] = de
 	}
 	sort.Strings(names)
 
@@ -109,7 +112,13 @@ func handleMsgs(w http.ResponseWriter, r *http.Request) {
 		if err != nil || !json.Valid(b) {
 			continue // 正在被写、或者被删掉了，跳过就行，下一轮还会再来
 		}
-		out = append(out, msgFile{Fn: n, M: b})
+		var mt int64
+		if de, ok := ents[n]; ok {
+			if fi, err := de.Info(); err == nil {
+				mt = fi.ModTime().UnixMilli()
+			}
+		}
+		out = append(out, msgFile{Fn: n, Mt: mt, M: b})
 	}
 	writeJSON(w, map[string]interface{}{
 		"items":   out,

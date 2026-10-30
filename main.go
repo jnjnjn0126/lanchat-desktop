@@ -35,7 +35,7 @@ import (
 //go:embed web/index.html
 var webFS embed.FS
 
-const appVersion = "3.2"
+const appVersion = "3.3"
 const shareFolderName = "局域网聊天共享"
 
 /* ===================== 配置 ===================== */

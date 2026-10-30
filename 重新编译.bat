@@ -1,17 +1,17 @@
 @echo off
-rem 重新编译 Lanchat.exe（需要 ..\tools\go，用法见 使用说明.txt）
+rem 重新编译 Lanchat.exe（需要 E:\tools\go，用法见 使用说明.txt）
 rem 注意：rsrc_windows_amd64.syso 里装着 exe 的图标资源（蓝底白气泡 logo），
 rem       删掉它就编不出带图标的 exe 了，构建时不要清理这个文件。
 setlocal
 cd /d "%~dp0"
-set "GOROOT=%~dp0..\tools\go"
+set "GOROOT=E:\tools\go"
 set "PATH=%GOROOT%\bin;%PATH%"
-set "GOPATH=%~dp0..\tools\gopath"
+set "GOPATH=E:\tools\gopath"
 set "GOPROXY=https://goproxy.cn,direct"
 
 where go >nul 2>nul
 if errorlevel 1 (
-  echo [错误] 没找到 go 命令。请确认 ..\tools\go\bin 存在。
+  echo [错误] 没找到 go 命令。请确认 E:\tools\go\bin 存在。
   pause
   exit /b 1
 )
