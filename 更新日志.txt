@@ -1,0 +1,672 @@
+局域网聊天 更新日志（exe 原生版）
+==================================================
+网页版 v1.0–v1.6 的历史见 lanchat_v1.6\更新日志.txt
+
+【版本规则】
+1. 改代码 → 递增版本号（exe 版在 main.go 的 appVersion + web/index.html 的 APP_VERSION）
+2. 程序文件夹同步改名（lanchat_exe_v2.7 → lanchat_exe_v2.8）
+3. 本文件追加一条记录
+4. 双击「重新编译.bat」重新生成 exe
+
+--------------------------------------------------
+[v3.2]  2026-10-26   文件库 / 预览 / 变动通知 / 归档 + 断点续传 / 并发 / 打包 + 待办 / 置顶 + 消息懒加载
+· 一、文件相关（新增「文件」视图）
+    - 之前共享文件夹只能靠聊天记录看，别人从资源管理器放进去的东西在程序里
+      完全看不见。现在聊天区顶部多了  聊天 | 文件 | 待办  三个视图。
+    - 文件页列出共享文件夹根目录和子目录：文件夹排前、文件按修改时间倒序、
+      顶部显示当前路径和总大小；进子目录有「↑ 上一级」；搜索框自动变成
+      「搜索文件名」。_lanchat 目录和没传完的 *.part 不显示。
+    - 每行右侧四个操作：预览 / 打开 / 定位 / 删除。删除删的是真文件，
+      两台都没了，所以先弹确认。单击一行 = 能预览就预览，否则用默认程序打开。
+    - 新增接口：GET /api/files（列目录）、/api/open（默认程序打开）、
+      /api/preview（预览）、/api/archive（归档建议 / 执行）、/api/zip（打包）。
+· 二、在线预览
+    - 文本 / 代码 / CSV / JSON / 日志走 text/plain; charset=utf-8；
+      图片、音视频、PDF 用 http.ServeContent 支持拖动进度条，
+      并且回 Content-Disposition: inline（不然 WebView2 会把 PDF 当附件下载）。
+    - 中文 GBK 编码的 txt 自动识别：先用 windows.MultiByteToWideChar
+      （代码页 0 = CP_ACP，也就是系统默认 ANSI）转 UTF-16。
+      判断是否 UTF-8 只校验前 4KB —— 整文件校验会因为截断点正好切在汉字
+      中间而误判成 GBK，导致好好一个 UTF-8 文件变乱码。
+    - 文本超过 2 MB 只发前 2 MB，靠 X-Truncated 响应头告诉页面，页面顶部
+      提示「只显示前 2 MB，要看全用打开」。
+    - 其他类型（docx / xlsx / zip…）返回 415，页面提示改用默认程序打开。
+    - 预览浮层 #pv 从 top:42px 开始，不遮标题栏的拖拽区和关闭按钮。
+· 三、共享文件夹变更通知
+    - 没用 ReadDirectoryChangesW，采用「定期快照 + 比对」：2.5 秒扫一次
+      根目录（只一层），签名是 名字+大小+修改时间，变化的进一个 200 条
+      的环形事件队列，seq 自增。SMB 网络共享上变动通知经常静默失效，
+      快照法稳、代码量也小一个数量级。
+    - 新接口 GET /api/watch?after=<seq>，页面每 2 秒拉一次，收到别人放进来
+      的文件就在聊天里插一条系统提示，点它跳到文件页。
+    - 自己写文件时不报（否则发完文件自己先收到一条）：handleWrite /
+      handleMkdir 里调 watcher.noteSelf(名字)，30 秒内同名的变化算自己干的。
+    - 系统提示只在本地显示、不写聊天记录，两台各写一条就重了；
+      页面侧还按 seq 去重（一次轮询可能重复消费同一批事件）。
+    - 共享断开时把快照清空并置 seeded=false，恢复后重建基线，
+      免得把老文件全当成新文件报一遍。
+· 四、根目录归档建议
+    - 根目录散着 ≥20 个文件时，文件页顶部出现「把 2026-10 的 N 个归到
+      「2026-10」目录？」。GET /api/archive 只算建议，POST 才真搬（os.Rename）。
+    - 只碰根目录的散文件：目录、_lanchat、*.part 一律跳过；被别的程序占用的
+      跳过并在结果里报数量。
+· 五、传输相关
+    - 断点续传：新增 GET /api/stat 拿目标文件已有大小；前端 createWritable
+      增加 keep 选项（不截断，第一次也走 append），从 .part 已有字节往后续写，
+      传完再 /api/rename 成正式名。测试里 5 MB 文件带了 2 MB 的 .part，
+      最终正好 5242880 字节（不是 7 MB），说明确实是续写不是重传。
+    - 文件夹并发复制：sendFolder 拆成 sendFolder（判断要不要问打包）+ 
+      doSendFolder（4 路 worker 从队列里抢文件），原来是 for 循环 await 串行。
+    - 打包发送：拖进来的文件夹 ≥30 个文件时先问一句，选「打包发送」就在
+      页面里压成 zip 再上传。为什么在页面里压：从 <input>/拖拽拿到的只有
+      File 对象，没有绝对路径，Go 那边读不到原始文件。
+      因此手写 zip：local header 30 字节 + central directory 46 字节 +
+      EOCD 22 字节，CompressionStream('deflate-raw') 压缩（不支持就 store），
+      CRC32 查表，文件名打上 UTF-8 标志位 0x0800。只用标准 Web API，
+      不引任何第三方库。文件页对文件夹点「打包」走后端 /api/zip。
+    - 用 self-drawn 的 #askbar 轻确认条替代 window.confirm ——
+      WebView2 里 window.confirm 的行为不稳（有时直接返回 true）。
+· 六、协作相关（不做共享剪贴板、不做导出会话）
+    - 待办清单：共享文件夹\_lanchat\todo.json，结构
+      {v, items:[{id,text,done,by,ts,doneBy,doneTs}]}；接口
+      GET/POST /api/todo，POST 的 op 有 add / toggle / del / clearDone。
+      勾完记下「谁完成的、什么时候」，标签上的数字是未完成条数。
+    - 置顶公告：\_lanchat\pin.md，GET/POST /api/pin，text 为空就删文件。
+      顶部黄条显示；点 × 只在本机收起（存 localStorage）。留空保存 = 清空。
+    - 两个文件都走 writeAtomic（先写 .tmp 再 rename）+ 进程内 mutex，
+      两个人在同一秒改也不会读到半个文件。跨机器仍是最后写入者赢，
+      日常够用。
+· 七、消息存储优化（启动快了很多）
+    - 老实现：启动时列一遍 msgs 目录，再对每条消息发一次 /api/read。
+      几百条还行，几千条就要几十秒。
+    - 现在后端批量读：GET /api/msgs?path=&before=&after=&limit=，
+      一页默认 300、上限 800，返回 [{fn, m}]。文件名是
+      「13 位时间戳-6 位随机.json」，字典序就是时间序，排序和筛选全在
+      文件名上做，不读文件内容、不 stat。
+    - 前端懒加载：启动只取最近 400 条，MSG_WATER 记最新 ts 做增量水位；
+      列表滚到离顶 60px 以内触发 loadEarlier()，取 before=<最早 ts>&limit=200，
+      取完用 scrollTop += scrollHeight - h0 把视口钉在原地（不然会跳）。
+    - tick() 里对 watch 的轮询也统一到这一处，避免各处定时器打架。
+· 八、整体代码审查（简洁性 / 必要性 / 占用）
+    - 新增功能按职责拆成独立文件：msgs.go（批量读消息 + stat）、watch.go
+      （目录快照）、library.go（文件列表 / 预览 / 归档 / 打包 / 打开）、
+      collab.go（待办 + 置顶）。main.go 只留路由和启动逻辑，不再继续膨胀。
+    - 删掉确认为死代码的四处：
+        · Go：pendingPayload()（真正的实现是 takePendingMsg，这个是老版本残留）
+        · Go：removeShare() 和 pNetShareDel（从来没删过共享，冲突只会加后缀）
+        · Go：isPreviewable()（预览分支直接按扩展名查表，用不到它）
+        · JS：WINMODE / applyWinMode / setWinMode（v2.8 删主页后就已经没有
+          「切换形态」这回事，只剩一个恒等于 'chat' 的空壳和三次无用调用。
+          改成启动时给 body 加一个 mode-chat 类，行为不变，少了 9 行）
+        · Go：/api/window 的 "mode" 动作和 setWindowMode()（同一件事的后端一半）
+        · CSS：.wsep、.nsmsg.warn（都是旧标题栏 / 旧提示样式，已无人使用）
+    - 修一个真 bug（顺手查出来的）：文件页的搜索原来「慢一个按键」。
+      渲染挂在 input 监听里、关键词在另一个监听里更新，两者顺序固定，
+      所以第一下渲染永远用的是上一次的关键词。现在把「文件页 / 待办页
+      重新渲染」统一收进 applyFilter()，同一个按键只渲染一次，关键词一定是新的。
+      文件页可能上千行，连续打字时攒 90ms 再渲染，不会一顿一顿。
+    - 修一个潜在卡顿：目录扫描（watch.scan）原来全程持锁做 os.ReadDir。
+      共享盘掉线时 ReadDir 会卡十几秒，而发消息要调 noteSelf（同一把锁），
+      结果就是「网盘一断，界面跟着僵住」。现在 ReadDir 放到锁外，
+      只把「比对 + 入队」这一小段放进锁里，并加了「扫到一半换了文件夹就作废」
+      的检查。
+    - 预览的编码判断从「整体 utf8.Valid 最多扫 3 遍」改成只看末尾几个字节
+      （utf8.DecodeLastRune），2MB 文本的预览少扫 6MB 内存。
+    - /api/zip 增加空 root 校验（还没打开共享文件夹时返回 400 而不是 500）。
+    - 函数查重：后端 100+ 个函数、前端 200 个函数都没有重名；
+      所有文件操作仍然统一过 cleanPath（远程路径另外走 resolveOpenPath）。
+    - 体积 6.78 MB（v3.1 是 6.3 MB，多出来的是新功能），
+      常驻内存与 v3.1 基本持平；消息轮询从「列目录 + 每 400ms 全量比对」
+      变成「一次批量接口 + 400ms 增量」，几千条记录时启动从几十秒降到 1 秒内。
+· 九、测试
+    - 内置自检 ?selftest=1 全绿（30 项断言 + 12 项计数），errors 为空。
+      跑法：bash tests/run_self.sh（独立 APPDATA，不碰真实配置）
+    - 原生 e2e（真实后端 + 无头 Chrome + CDP）：文件页列表/不显示 _lanchat/
+      显示真实路径、文件页搜索（按当前关键词过滤 + 清空恢复）、预览正文、
+      待办增删勾、置顶横幅、变动通知、断点续传 5242880 字节、打包发送先问
+      后产出 zip 且不铺散文件、归档建议 27 个并真搬进 2026-10\、全程无 JS 异常。
+      跑法：bash tests/run_v32.sh
+    - 产出的 打包测试.zip 用 Python zipfile.testzip() 独立校验：40 个条目、
+      无损坏、前缀 打包测试/a/b0/文件0.txt 正确。
+    - 测试全程用独立 APPDATA（C:\Temp\lc32t / lcself），不碰真实配置。
+
+
+--------------------------------------------------
+[v3.1]  2026-10-26   身份不再丢失 + AI 消息适配 + @ 提及
+· 一、修「每次重启昵称被重置」和「自己发的消息跑到左边」（同一个病根）
+    - 根因：昵称和 peerId 原来只存在页面的 localStorage 里，而 exe 每次启动
+      监听的端口都是随机的（127.0.0.1:0），端口一变页面的 origin 就变了，
+      localStorage 相当于换了一个空抽屉 —— 于是昵称回到「电脑-XXXX」，
+      peerId 也重新生成。老消息记的是旧 peerId，自然对不上，就被当成
+      别人发的排到左边去了。
+    - 现在身份存在配置文件 %APPDATA%\LanChat\config.json 的 profile 里：
+        "profile": { "name": "小明", "peerId": "4248dc32…" }
+      peerId 首次启动生成一次，之后固定不变；昵称改了就写进去。
+      重启不丢，换共享文件夹也跟着走（这就是「一台电脑的昵称在所有文件夹里
+      是同一个」）。
+    - 新增接口 /api/profile（POST {name}），/api/info 多返回 peerId 和 nick。
+· 二、判定「自己发的」改成双保险
+    - 以前只比 peerId。升级前那些老消息的 peerId 已经找不回来了，
+      于是加了设备名兜底：m.dev 等于本机计算机名的，也算自己发的。
+    - 效果：升级后打开历史记录，以前错跑到左边的自己消息会自动回到右边。
+· 三、AI 消息适配
+    - bot:true 的消息：头像换成紫色机器人图标、昵称后面加一个「AI」标签，
+      一眼能看出不是人。
+    - 打字机效果：机器人回复带 pending:true 时，前端每轮重读这个文件，
+      内容一变就原地刷新气泡，末尾还有一根闪烁的光标 —— 配上
+      LanchatBot v1.1 就是逐字冒出来。收尾后 pending 去掉，光标消失。
+· 四、@ 提及
+    - 输入框里打 @ 自动弹出候选（当前在线的其他设备，AI 机器人自动在列，
+      并且排在第一个）。支持上下键选、回车或 Tab 确认、Esc 关掉，
+      继续打字会按名字过滤；没人在线时给一句明确的提示。
+    - 消息右键菜单多了「＠ 提到 XXX」（对方的消息才有，自己的没有），
+      点一下把「@名字 」塞进输入框。
+    - 配合机器人 v1.1：触发词按最长匹配，「@AI 助手」会被整体吃掉，
+      不会把「助手」两个字留在问题里。
+· 五、顺带
+    - 页面暴露 __LANCHAT_API.me() / isMine() / atTargets() 等，给自动化测试用
+    - 自检项增加 mineByDev / botStyled / atMention / ctxMention / meId
+
+--------------------------------------------------
+[v3.0]  2026-10-25   三个按钮统一 + 「文件夹内打开」修好远程 + 文件/文件夹直落共享文件夹
+· 一、每个气泡都是三个按钮（自己和对方的都一样）
+    - 以前：本机的气泡只有「复制 + 打开文件夹」，对方的气泡只有「复制 + 另存为」，
+      想另存自己发的文件、想定位对方发的文件，都没地方点
+    - 现在统一成三个（buildActions 不再看 mine / other 分支）：
+        · 复制     文字→复制文字；图片→复制图片（PNG 进剪贴板）；
+                   文件/文件夹→把**本体**放进 Windows 剪贴板（CF_HDROP）
+                   —— 可以直接粘到资源管理器、微信、Word 里，不再是「复制文件名」
+        · 文件夹内打开  在资源管理器里选中这个文件 / 打开这个文件夹
+        · 另存为…      弹系统「选择文件夹」对话框，整份复制过去；文字消息存成 .txt
+    - 文件卡片的那个小按钮也跟着变：v3.0 的文件/文件夹显示「打开」（直接弹资源管理器），
+      老消息（还在 _lanchat\blobs 里的）仍然显示「保存」
+
+· 二、修 bug：「文件夹内打开」在共享文件夹不在本机时打不开
+    - 原因有两个，都跟「路径形态」有关：
+        ① 共享文件夹在对方电脑上时，本机这一侧往往是一块映射网络盘（Z:）。
+           映射盘只在「当前登录会话」里存在 —— 程序一旦以管理员身份跑，
+           或者换了用户，Z: 在这个进程里根本看不见，explorer 自然也打不开
+        ② 后端 handleReveal 原来用 cleanPath（必须落在共享根内）校验，路径是
+           网络盘/共享地址时经常被判成「路径不在共享文件夹内」，直接 400
+    - 修法：
+        · 新增 files_win.go，里面有 dirAddress()：把当前共享根统一算成共享地址
+            - 本来就是 \\主机\共享名  → 原样
+            - 是一块映射盘（Z:）      → WNetGetUniversalNameW 查它映射到哪，换回共享地址
+            - 是本机磁盘              → coverShare() 找覆盖它的共享，拼成 \\主机\共享名\子目录
+          /api/where 把它和 root、kind（unc/map/local）一起返回给页面
+        · 页面在 enterRoom 时取一次（S.where），之后：
+            - 气泡里的地址显示用它（两台电脑看到的是同一个地址）
+            - kind 是 map/unc（也就是共享文件夹不在本机）时，「文件夹内打开」「复制」
+              「另存为」都改走共享地址，不再依赖本机盘符
+        · handleReveal 不再套 cleanPath，改成 resolveOpenPath()：
+            先看本机路径在不在 → 不在就把映射盘换成共享地址再试 → 反方向（共享地址
+            换成本机盘符）也试一次 → 都不行才报「打不开这个位置：… 现在访问不了
+            （网络盘可能没连上）」，不再默默把资源管理器开到一个莫名其妙的地方
+        · 打开失败时先试 explorer.exe，再兜底 ShellExecuteW；文件才用 /select，
+          文件夹直接打开目录本身（原来没区分）
+        · 侧边栏的「在文件管理器中打开」也走同一套解析
+
+· 三、文件 / 文件夹：直接复制进共享文件夹，消息显示地址
+    - 以前：不管什么文件都塞进 _lanchat\blobs，文件名变成「时间戳-id__原名」，
+      资源管理器里根本看不出是什么；发文件夹则直接发不出去（拖进来只会得到一个 0 字节的坏文件）
+    - 现在：
+        · 普通文件 → 共享文件夹根目录，**用原来的名字**；重名自动「名字 (2)」
+          传输时先写「名字.part」，传完再 /api/rename 改成正式名字
+          （中途断了不会留下一个「看起来完整」的坏文件，也不会出现半截消息）
+        · 文件夹 → 整个目录树照抄进共享文件夹（子目录、文件都在），重名同样加 (2)
+          拖进来的文件夹用 webkitGetAsEntry 递归读，不用先拿到真实路径
+          新增工具条按钮「发送文件夹」（<input webkitdirectory>），按
+          webkitRelativePath 还原目录树
+        · 消息格式新增 {type:'folder', name, path, files, size}，
+          「文件」消息多了一个 path（相对共享根的位置）；两种都显示：
+            名字 / N 个文件 · 大小 · 在共享文件夹里 / \\主机\共享名\名字
+        · 图片还是走 _lanchat\blobs（气泡里要直接预览，粘贴进来的截图也没名字）
+    - 新接口：
+        /api/where           当前共享根的本机路径 + 共享地址 + 类型
+        /api/unique          {parent,name,dir} → 不重名的名字
+        /api/rename          {from,to}   .part → 正式名
+        /api/copy            {src,dstDir,name?} → 文件/文件夹整份复制（递归、重名自动改）
+        /api/save-text       {dir,name,text} → 文字消息另存成 .txt
+        /api/clipboard-file  {path} → CF_HDROP，把文件本体放进剪贴板
+    - 删除语义跟着改（重要）：删掉一条文件/文件夹消息只删聊天记录，
+      共享文件夹里的那个文件/文件夹**不动**（确认框里会写明）；
+      图片消息（在 _lanchat\blobs 里）还是跟着一起删
+    - 老消息兼容：没有 path、只有 blob 的（v2.9 及以前发的）照常显示、打开、另存为，
+      另存时会用消息里记的原名，不会带出那串时间戳
+
+· 顺带修
+    - 空状态下往窗口里拖东西，原来会抛「Cannot read properties of null」；
+      现在先检查有没有打开共享文件夹，提示「先从左边的列表里选一个共享文件夹」
+    - /api/info 和 /api/set-root 返回的文件夹名用 pathName()，
+      根目录是 Z:\ 时不再返回一个「\」（标题栏显示成正常的「Z:」）
+    - handleSetRoot 之外的复制、另存、剪贴板全部走 resolveOpenPath，
+      所以映射盘/共享地址两种写法都认
+
+· 验证
+    - ?selftest 全绿：acts=true（每行 3 个按钮，actTitles 覆盖复制文字/图片/文件/文件夹）、
+      actsOwn/actsPeer 都 true、新增 dirs=1 / paths=2 / folderMsg=true、
+      footTools=7（多了发送文件夹）、errors 空
+    - CDP 原生模式 e2e（cdp_test.mjs）：发文字 / 图片 / 文件 / 文件夹之后
+        DISK_ROOT 里出现「e2e文件.txt」「e2e文件夹」，DISK_FOLDER 里
+        a.txt + 子目录/b.txt 内容都对，DISK_FILE 没有残留 .part；
+        卡片地址从「C:\Temp\lc30\…」变成「\\XIN-Laptop\lc30\…」（做共享后自动换成共享地址）
+    - CDP 剪贴板：点文件气泡的「复制」→ Get-Clipboard -Format FileDropList 能拿到那个文件
+    - CDP 拖拽（Input.dispatchDragEvent 真拖 C:\Temp\dropdir）：
+        webkitGetAsEntry 拿到 dir:dropdir → 共享文件夹里出现 dropdir\a.txt + 子目录\b.txt
+        拖单个文件 dragone.txt → 直接落在共享文件夹根目录
+    - 接口单测：unique 重名 →「新建文件夹 (2)」；copy 带 name → 存成「漂亮的名字.txt」；
+      reveal 一个不存在的路径 → 400「打不开这个位置…（网络盘可能没连上）」
+    - 截图新增：chat_actions_peer / chat_actions_mine（对方/本机气泡的三按钮）、
+      chat 里能看到文件卡片和文件夹卡片的地址
+
+--------------------------------------------------
+[v2.9]  2026-10-25   修：「本机的网络共享」那一组里的条目删不掉
+· 问题
+    - 侧边栏有两组：「最近打开」来自配置里的 recents，「本机的网络共享」来自
+      NetShareEnum 实时枚举。右键删除只调 /api/forget-recent，只删了前者，
+      后者照样把同一个目录再列一遍 —— 看起来就是「删了还在」
+    - 更迷惑的是：一个本身是共享的目录被从「最近打开」删掉后，会掉到下面那组，
+      两组都在的时候删上面那条，下面那条纹丝不动
+· 修法（只动列表：不取消 Windows 共享，也不碰磁盘上的文件）
+    - config 新增 mutedShares：被手动删掉的共享路径（小写、反斜杠归一化，最多 64 条）
+    - 新增 POST /api/mute-share {path, mute?}：写一条 / 去掉一条隐藏记录
+    - /api/recents 返回 shares 之前先过滤 mutedShares，所以重启后也不会再冒出来
+    - pushRecent() 里顺带 dropPath(mutedShares)：以后再主动打开这个目录，
+      隐藏记录自动失效，它会照常回到列表（不用手动恢复）
+· 前端
+    - 侧边栏每行加 data-kind（cur / recent / share），右键删除时按来源分三种：
+        · 这一行在「本机的网络共享」里，或者这个路径本身是一条共享
+          → 先 mute-share 再 forget-recent，两组一起消失
+        · 右键的是当前正在聊的那条 → 菜单文案变成「删除（并关闭这个聊天）」，
+          确认框里说明会回到空状态，删完调用 leaveRoom()
+        · 普通「最近打开」→ 和以前一样，只 forget-recent
+    - 确认框文案按来源拼：哪几组会消失、会不会关掉当前聊天，都写清楚
+    - 删掉 sbHasPath()（v2.7 用来判断「是不是掉到下面那组了」）和那句
+      「它仍是本机的网络共享，还留在下面那组」的 toast —— 现在不会再留在那儿了
+· 顺带修
+    - UNC 路径（\\主机\共享名）的显示名：filepath.Base 对 UNC 返回的是奇怪的值，
+      侧边栏会出现一行名字只有一个「\」的条目；新增 pathName() 按 \ 和 / 两种
+      分隔符取最后一段，pushRecent 与 /api/recents 都改用它
+· 验证
+    - ?selftest 全绿：新增 sbKinds = "cur,recent,recent,share"，errors 空
+    - CDP：右键「测试共享29」→ 确认框「也会从「本机的网络共享」那一组里消失」
+      → 删除后点刷新重新拉列表，still:0（隐藏记录确实写进了配置，不是只改了界面）
+    - CDP：右键当前正在聊的那条 → 菜单「删除（并关闭这个聊天）」→ 确认框写明会关闭
+      → 删完 noRoom=true、emptyShown=true、当前行 0
+    - 截图新增：chat_sb_share_confirm / chat_sb_share_deleted /
+      chat_sb_cur_delete_confirm / chat_sb_cur_deleted
+
+--------------------------------------------------
+[v2.8]  2026-10-25   删掉主页：启动直接进聊天页，窗口只剩一种形态
+· 删掉的东西
+    - #setup 整块 DOM（logo、昵称输入框、继续上次、文件夹列表 ▾、新建共享文件夹、版本行）
+    - 对应的 CSS：.card / .brand / .field / .mainbtns / .pickmenu / .pmitem / .winmini /
+      .minibtn / body.native.mode-home
+    - 对应的 JS：PM（文件夹列表二级菜单，closePickMenu/openPickMenu/renderPickMenu/
+      pickOrMenu/openNativeDir）、showResume/hideResume/bindNativeResume/LAST_NATIVE、
+      主页按钮绑定（createBtn/pickBtn/recentBtn/btnHomeCfg/btnHomeClose）
+    - 窗口模式：home（336×344）和 dialog（520×600）都不再存在，只剩 chat（1040×720，
+      可拉伸、可最大化）；win_ui.go 的 homeWinW/dialogWinH 常量一并删掉
+· 为什么删
+    - exe 版启动时只要配置里记着上次的文件夹，boot 就会自动进聊天页，主页只在
+      ① 首次运行 ② 上次的文件夹被移动/删除/网络盘没连 这两种情况露脸
+    - 而它干的三件事在聊天页里都有：自动打开上次、侧边栏列表、侧边栏底部新建
+    - 附带的毛病：启动先按 home 画一张小卡片再切 chat 放大，老用户每次都能看到
+      「窗口缩一下又弹开」
+· 换成了什么
+    - 新增 #empty 空状态（铺满聊天区）：蓝底气泡 logo + 「还没有共享文件夹」+
+      一行指引「在左边的列表里点一个文件夹进去，或者点左下角的新建共享文件夹开始」
+    - exe 版空状态不放按钮（入口就是侧边栏底部那两个），网页版没有侧边栏，所以
+      .ebtns 里保留了「新建共享文件夹 / 打开已有文件夹」两个按钮，用 body.native 隐藏
+    - 空状态时：侧边栏强制展开（否则找不到入口），输入框/发送/搜索/发图发文件/删除
+      这些按钮统统 disabled，placeholder 改成「先从左侧列表选一个共享文件夹」
+    - leaveRoom() 不再切回主页，改成：清空列表 → showEmpty(true) → 重载侧边栏
+· 新建共享文件夹的卡片改成聊天窗口内的浮层
+    - 不再 setWinMode('dialog') 把窗口缩成 520×600；现在是半透明遮罩 + 居中卡片
+      （496 宽），标题栏和窗口按钮一直在，关掉就回到原来的聊天
+    - NS.back / WINMODE==='dialog' 那套「关掉之后回哪个模式」的逻辑一起删掉
+    - 网页版（非 native）本来就是浮层样式，这次统一成一套
+· 前端窗口模式代码收口
+    - WINMODE 固定 'chat'，applyWinMode 只加 body.mode-chat，setWinMode() 变成空操作
+      （enterRoom 等地方还在调，不改调用点）
+    - 删掉 WIN_APPLIED：模式不会再变，不需要「只有变了才通知后端」的二次保险
+· 后端（win_ui.go）
+    - winMode 默认值 home → chat；applyFrameless(h,"chat")；/api/window {mode} 只认 chat，
+      传 home/dialog 返回「v2.8 起窗口只有 chat 一种形态」
+    - styleForMode 固定带 WS_THICKFRAME；modeSize 只剩默认分支
+    - 托盘/自检标题里的版本号跟着变
+· 帮助入口搬家
+    - 原来在主页卡片右上角，主页删了就挪到聊天页标题栏「?」，在窗口按钮左边
+    - .helppop 改成 right:0 对齐，宽度 min(300px, 100vw-26px)，z-index 提到 130
+      （要压住 body.native:after 那圈 1px 边和 header），文字左对齐
+· 昵称
+    - 主页输入框删了，昵称只存在 localStorage（lanchat.name），默认「电脑-XXXX」
+    - 要改：输入框上方工具条的人像按钮（一直是这个入口，没变）
+· 顺带清掉
+    - 输入框上方少一个按钮（原来是 7 个：多一个「换文件夹」箭头），现在是 6 个：
+      文件夹 / 图片 / 文件 / 昵称 / 垃圾桶 / 齿轮
+    - 侧边栏删除文件夹后不再需要「同步主页列表」那一步，只重载侧边栏
+
+· 验证
+    - ?selftest 全绿：settings(helpInBar=1, winbarBtns=3) / newshare(nsFill+nsCardIn+
+      emptyState) / sidebar / menuOk / ctxMenu / multiSel 等全 true，errors 空
+    - CDP（1080×760）：
+        EMPTY {"shown":true,"covers":true,"inputDisabled":true,"toolsDisabled":true,
+               "sbVisible":true,"noHome":true,"ebBtnsHidden":true,"mode":"chat"}
+        HELP_POP visible right=952 winW=1080 inWin=true
+        NEWSHARE {"mode":"chat","overlayCovers":true,"boxW":496,"barStillThere":true}
+        NEWSHARE_DONE {"done":true,"path":"...\\lc28\\demo\\演示共享","perm":"读写..."}
+        NO_ROOM {"emptyShown":true,"rows":0,"inputDisabled":true,"mode":"chat"}
+        SB_DELETE {"inRecent":0}
+        MIN {"barW":780,"lastBtnRight":772,"barOverflow":false,"searchGapToInput":0}
+    - 外壳自检（真实窗口，LANGCHAT_SHELLTEST=1）：
+        hwnd 1040×720 style=0x96070000 thickframe=true
+        max → {"maximized":true,"rect":1920×1032}；再 max → 还原 1040×720 在 440,156（原位）
+        mode=chat → 不挪窗口；mode=home → 400「v2.8 起窗口只有 chat 一种形态」
+
+--------------------------------------------------
+[v2.7]  2026-10-25   右键菜单（文件夹列表 / 聊天气泡）+ 多选删除 + exe 改名 Lanchat、图标统一
+· 侧边栏文件夹列表右键（v2.7）
+    - 菜单两项：「在文件管理器中打开」「删除（从列表移除）」
+    - 打开：POST /api/reveal-dir，校验目录存在后 startDetached explorer.exe
+    - 删除：POST /api/forget-recent，只从 config.Recents 里摘掉这一条，磁盘文件一律不碰；
+      删完 PM.data 作废 + 侧边栏重载，所以主页「文件夹列表」同步少一条（同一份数据）
+    - 细节：目录本身还是 Windows 共享时，它会掉到「本机的网络共享」那组继续显示，
+      toast 会说明这一点，不然看起来像「删了还在」
+    - handleRecents 顺手做了路径归一（filepath.Clean）并按小写去重：老配置里存正斜杠的
+      记录（C:/Users/...）会跟反斜杠的重复成两行，删掉一条还剩一条
+
+· 聊天气泡右键（v2.7）
+    - 「删除这条消息」：确认框 → deleteMsgs([id])，删记录文件 + blob + 写删除标记（对方同步消失）
+    - 「多选」：startSel(row) 进入 selmode，气泡外侧露出勾选框，点气泡勾选/取消，
+      底部浮条显示「已选 N 条」+「删除」「取消」，Esc 退出；多选中右键=快速勾选
+    - 单条与批量走同一条 deleteMsgs 路径，只是 id 数组长度不同
+
+· 品牌与图标（v2.7）
+    - exe 改名 Lanchat.exe；窗口标题、托盘提示、自检窗口标题一并改成 Lanchat
+    - 图标：新写 tools/icongen 生成 build/icon.ico（16/24/32/48/64/128/256 全尺寸，
+      蓝底圆角方块 + 白色对话气泡，形状照主页 .brand 的 logo），再用 rsrc 生成
+      rsrc_windows_amd64.syso 编进 exe —— 资源管理器、任务栏、Alt+Tab 都是它
+    - win_ui.go：新增 appIconFromRes()，用 LoadImageW(hInst, 1, IMAGE_ICON, size, size)
+      按尺寸取；托盘 32px、大图标 32px、小图标 16px；取不到才退回原来 drawAppIcon 的代码画法
+    - 验证：用 LoadLibraryEx(LOAD_LIBRARY_AS_DATAFILE) + LoadImage 试 id=1 在 16/32/48
+      都能拿到 HICON，id=2/99 取不到 —— 说明资源组 ID 就是 1
+
+· 修：右键菜单里的红色项被全局 button.danger 规则涂成整条红底白字
+    - 全局有 button.danger{background:#e5484d}，(0,1,1) 权重压过 .ctxitem.danger(0,1,0)
+    - 改成 .ctxmenu button.ctxitem.danger{background:transparent;color:#d8383e}，只留红字红图标
+
+· 验证（CDP，1080×760 / 780×520 / 336×344）
+    - ?selftest 全绿：ctxMenu / ctxClosed / multiSel / delN / sbCtx 新增，原有 24 项不变，errors 空
+    - CTX {"items":["删除这条消息","多选"],"inView":true}；SEL 已选 2 条、barY=601、勾选框可见
+    - DELETE 5→3（多选 2 条）、DELETE_ONE gone=true rows=3（单条）
+    - SB_DELETE inRecent=0 / 主页 MENU delGone=true（两边同步）
+    - 最小窗口 780×520 下标题栏按钮最远 772px 不溢出，搜索框与输入框右边缘仍 0px
+
+--------------------------------------------------
+[v2.6]  2026-10-25   修「切文件夹窗口跳回屏幕中间」+ 标题栏/工具条重排 + 聊天记录搜索 + 侧边栏可收起
+· 修 bug：聊天页侧边栏切换文件夹时，窗口被挪回屏幕正中间（尺寸也一起被重置）
+    - 原因：enterRoom 每次进房间都发一次 /api/window {mode:"chat"}，后端的 setWindowMode
+      不管当前是不是已经这个模式，都调 placeCentered 重新居中 + 重设尺寸，所以只要在聊天页里
+      换文件夹（或者在同一个模式里重复调用），窗口就「跳回去」，用户拖到哪里都没用
+    - 后端：setWindowMode 改成同模式直接返回，只同步窗口样式和圆角区域，位置、大小、
+      最大化状态全都不动（win_ui.go）
+    - 前端：新增 WIN_APPLIED 记录后端当前真实模式，setWinMode 只有模式真的变了才发请求
+    - 验证：外壳自检窗口把窗口挪到 120,90 / 1010×700 后连续两次发 mode=chat，位置尺寸保持不动；
+      再发 home、chat 才会正常换尺寸并居中（真换模式不受影响）
+· 聊天页标题栏（54px → 42px，单行）
+    - 不再显示当前聊天文件夹，固定显示「Lanchat + 本机设备名（Windows 计算机名）」横向排列，
+      后面跟一个小版本号角标，右边是在线状态（人数/等待对方），最右还是最小化 / 最大化 / 关闭
+    - 原先长在标题栏里的 5 个功能按钮（打开文件夹 / 图片 / 文件 / 昵称 / 清空 / 换文件夹 / 设置）
+      全部下移到消息输入框上方
+· 输入区（输入框上方新增一行工具条）
+    - 左边 7 个功能按钮：打开共享文件夹、发送图片、发送文件、修改昵称、删除记录、切换文件夹、设置
+    - 右边搜索框：和输入框同一列（.cwrap），右边缘与消息输入框右边缘严格对齐，与左侧按钮同一水平中线
+    - 搜索框：输入关键词即时筛选聊天记录，只显示匹配的气泡（不匹配的直接 display:none，不占位）；
+      匹配范围=文字内容 / 图片与文件名 / 昵称 / 设备名，不区分大小写；有内容时右侧出现 ✕ 清空，
+      Esc 也能清空；换文件夹时自动清掉关键词
+    - 输入框改成撑满整列（放在 .cwrap 里以后 flex:1 失效导致只剩默认 180px 宽，改成 width:100%）
+· 气泡昵称
+    - 改为「昵称 + 本机设备名」横向排列、下对齐，设备名字号比昵称小一号（11px / 10px），再跟时间
+    - 设备名来自 /api/info 的 host（本机）和消息里的 dev 字段（对方），老消息没有就退回对端心跳里的 host
+    - 本机消息也显示（原来只显示时间），这样多台机器用同一个共享文件夹时能看出是哪台发的
+    - 发消息时写入 dev 字段，心跳 peers/*.json 也记 host
+· 侧边栏可收起
+    - 标题栏最左边新增开关按钮（收起后按钮变蓝）；侧边栏头部也有一个 « 按钮
+    - 收起 = 宽度归 0（带 0.16s 过渡），正文自动占满；状态存 localStorage，下次打开保持
+· 版本号 v2.6：exe 标题、主页底部、聊天页角标、设置面板；文件夹改名 lanchat_exe_v2.6
+· 验证
+    - 页面 ?selftest 全绿，新增 4 项：search（筛出 2 条且全部命中、清空后恢复）、head（标题栏 Lanchat、
+      设备名 XIN-Laptop、标题栏功能按钮 0 个、输入框上方 7 个）、meta（昵称/设备名/时间齐全、
+      设备名字号更小且底边对齐）、sidebar（收起宽度 0 且正文变宽、展开恢复 198）
+      其余 create/acts/layout/settings/newshare/menuItems 全部为 true，errors 空
+    - CDP 实测：搜索「本机」→ 5 条里只留 2 条；搜索框右边缘与输入框右边缘差 0px；
+      工具条按钮与搜索框垂直中线差 0px；标题栏高 42px
+    - 最小尺寸 780×520：窗口按钮最远 772px 不溢出，搜索框 212px，与左侧按钮间距 40px
+    - 真实创建共享（CDP 点创建）拿到 C:\Users\...\lc26\demo\演示共享 → UNC \\XIN-Laptop\演示共享
+    - 截图：chat / chat_collapsed / chat_search / chat_min / chat_hover / home / home_help /
+      home_menu / newshare / newshare_done / settings
+    - 测试产生的临时共享「演示共享」与临时目录已删除
+· 备份：改动前的 v2.5 原样留在 ..\backup\lanchat_exe_v2.5_备份_20261025
+
+--------------------------------------------------
+[v2.5]  2026-10-25   主页排版重做 + 操作卡片去外框可拖拽 + 聊天页加文件夹侧边栏
+· 主页（窗口 336×344，从 380×408 收窄一圈；内容自然高度 330px，实测无滚动）
+    - 品牌区：logo 图标在上、"Lanchat" 在下，两者居中；去掉「共享文件夹直连 · 不经过任何服务器」那行小字
+    - 昵称去掉标题，输入框提示直接写「昵称：默认 电脑-XXXX」（跟着本机标识走）
+    - 主按钮改成两个并排：「继续上次」+「文件夹列表 ▾」
+        继续上次按钮上只写四个字（原来带文件夹名会把按钮撑成省略号），
+        具体是哪个文件夹放在鼠标悬浮提示里（名字 + 完整路径）
+        没继续上次时「文件夹列表」自动占满整行
+    - 「新建共享文件夹」挪到最下面，改成可点击的小字（带 + 号，悬停淡蓝底）
+    - 窗口标题/底部版本行同步改成 Lanchat
+    - 文件夹列表菜单改为相对「两个按钮那一行」定位（原来挂在小按钮里只有 145px 宽，
+      条目全被截断），现在整行宽 292px；打开时卡片其他内容淡到 40%
+    - 问号说明气泡改成贴卡片右内边缘展开（right:-46px），窄卡片下不会被窗口裁掉；
+      文案又删了一条，只剩 4 条
+· 新建共享文件夹卡片（窗口 520×600）
+    - 去掉外面那层包框：不再有 padding / 边框 / 16px 圆角 / 阴影，内容直接铺满整个窗口，
+      圆角交给 Windows 自己画
+    - 标题栏（"新建共享文件夹 / 建好文件夹、开好共享、给好权限"）就是拖拽区：
+      bindWindowDrag 挂在 .nstop 上，按住空白处可拖窗口，按钮上不触发
+    - 从聊天页里打开时记住来源，点 ✕ / 取消 会退回聊天页而不是主页（原来一律回主页，
+      会出现「窗口是小卡片但页面还是聊天页」的错位）
+    - 浏览器预览时仍然是居中浮窗卡片（body:not(.native) 走另一套样式）
+· 聊天页
+    - 标题栏顶部左右各 10px 圆角，跟窗口圆角对齐；聊天模式下 body 背景改白，四角不留灰边
+    - 标题栏下面新增侧边栏（198px，参考 QQ 会话列表）
+        数据来自 /api/recents：当前文件夹（蓝底高亮）+ 最近打开 + 本机的网络共享
+        右侧圆点：绿=已共享 / 灰=未共享 / 橙=找不到（点它给提示，不进去）
+        底部「打开其他文件夹…」「新建共享文件夹」
+        点一条 = 切过去：先停掉旧房间的 tick/beat 定时器，再 enterRoom（内部先 set-root 再建 _lanchat）
+        右上角刷新按钮；浏览器版隐藏侧边栏（没有多文件夹概念）
+    - 顶栏箭头按钮的行为说明改成「回到主页（换文件夹）」
+· 窗口层：dialog 模式 520×664 → 520×600（内容自然高度约 580，去掉外框后不留大片空白）
+· 版本号 v2.5：exe 标题、主页底部、聊天页角标、设置面板；文件夹改名 lanchat_exe_v2.5
+· 验证
+    - 页面 ?selftest 全绿：新增 sidebar 项（sbItems=4、当前项高亮、侧边栏紧贴标题栏下沿），
+      其余 create/acts/layout/settings/newshare/menuItems 与 v2.4 一致，errors 空
+    - 侧边栏切换实测：局域网聊天共享(E:) → 演示共享(C: 临时目录) → JNJNJN共享盘(D:) 三次跨盘切换全部成功，
+      每次标题、高亮项、消息列表都跟着换，errbar 为空
+    - 真实创建（CDP 点「创建」）拿到 C:\Users\...\lc25\demo\演示共享 → UNC \\XIN-Laptop\演示共享，读写权限
+    - 最小尺寸 780×520 下：标题栏 54px、右侧按钮最远到 770px 不溢出，侧边栏 198 + 正文 582
+    - 截图：home / home_help / home_menu / newshare / newshare_done / chat / chat_hover / chat_min / settings
+    - 测试产生的临时共享「演示共享」与临时目录已删除
+· 备份：改动前的 v2.4 原样留在 ..\backup\lanchat_exe_v2.4_备份_20261025
+
+--------------------------------------------------
+[v2.4]  2026-10-25   新建共享文件夹一张卡片搞定（建目录+开共享+授权）+ 已有文件夹二级菜单
+· 主页「新建」不再只是建个子文件夹，改成一张操作卡片（窗口临时放大成 520×664）：
+    位置（默认「文档」，可点「选择…」换） / 文件夹名 / 是否开启网络共享 / 共享名 / 对方权限
+    点「创建」后后端一次做完：建文件夹（含 _lanchat\msgs|blobs|peers）
+      → 开 SMB 共享（NetShareAdd）→ icacls 给 Everyone 只读(RX)或读写(M)权限
+    成功页显示文件夹路径、局域网地址 \\电脑名\共享名（带「复制」）、对方权限、
+      以及「另一台电脑怎么连」的三条提示，按钮可「再建一个」或「进入聊天」
+    失败（比如没管理员权限）会给出原因 + 「以管理员身份重启并补上」按钮：
+      把待办写进 config.pending，ShellExecuteW(runas) 重开自己，启动时 runPendingShare 自动补做，
+      /api/info 返回 notice，主页弹提示
+· 主页「打开已有的共享文件夹」变成二级菜单（在小卡片里向上展开，按可用高度限高+滚动）：
+    最近打开（标「已共享 / 未共享 / 找不到」）+ 本机的网络共享（NetShareEnum 枚举，名字带“聊天”的置顶）
+    + 浏览其他位置…（系统对话框）；点条目直接进，找不到的点一下给提示
+· 后端新增（share_win.go，348 行）
+    NetShareEnum / NetShareAdd / NetShareDel 直接用 netapi32（宽字符，不用解析 GBK 的 net.exe 输出）
+    共享策略：目标目录已有共享 → 复用；共享名被占 → 自动改「名字2」而不动别人的共享；
+      上级目录在共享里 → 备注里顺带给出那条现成路径
+    grantFolderACL 用 icacls "*S-1-1-0:(OI)(CI)M|RX" /T /C /Q（Everyone 用 SID，避免系统语言差异）
+    新增接口：GET /api/recents、POST /api/create-share、POST /api/relaunch-admin
+    config 新增 recents（最近 8 个文件夹）、pending / pendingMsg（管理员重启补做共享）
+· 窗口：新增第三种模式 dialog（520×664，不可拉伸），主页 ↔ 卡片 ↔ 聊天页三档切换
+· 修正一个老 bug：enterRoom 先建 _lanchat 再 set-root，导致「换到另一个文件夹」会被后端判成
+    「路径不在共享文件夹内」而失败。现在改成先 set-root 再建目录（跨盘切换已实测通过）
+· 版本号 v2.4：exe 标题、主页底部、聊天页角标、设置面板同步；文件夹改名 lanchat_exe_v2.4
+· 验证
+    - 接口：新建+共享（full/read）、目录已存在、共享名冲突自动改名、不开共享、
+      非法名字 400、位置不存在 400、recents 列表（含 exists/已共享/UNC），全部符合预期
+    - 窗口（LANCHAT_SHELLTEST=1）：home 380×408 / dialog 520×664 / chat 1040×720（客户区 1034×714），
+      切回 home 正常；dialog 与 home 一样不可拉伸
+    - 页面（Chrome 无头 + CDP）：?selftest 全绿（newshare:true、menuItems:3、errors 空）；
+      二级菜单向上展开 258px 不裁切；新建卡片 492×583 无溢出；
+      真实走了一遍「新建 演示共享」→ 得到 \\XIN-Laptop\演示共享 → 关闭回主页（mode=home）；
+      菜单点击进入 E://共享//局域网聊天共享、D://JNJNJN共享盘、C://Users 三个不同根目录全部成功
+    - 测试产生的临时共享（演示共享/测试共享B/局域网聊天共享2）与临时目录已全部清理
+· 备份：改动前的 v2.3 原样留在 ..\backup\lanchat_exe_v2.3_备份_20261025
+
+--------------------------------------------------
+[v2.3]  2026-10-25   主页独立成固定小卡片 + 聊天页标题并入拖拽区、可拉伸可最大化
+· 窗口改成两种模式，由页面切换时通知后端（/api/window 新增 action=mode，value=home|chat）：
+    home 主页：固定 380×408 的小卡片（不再有单独的顶部窗口条），按工作区居中
+    chat 聊天页：默认 1040×720，可自由拉伸（最小 780×520），可最大化到工作区大小
+· 主页：窗口本身就是那张卡片
+    - 卡片铺满窗口，去掉外边距/阴影（圆角交给窗口自己，Win11 DWM 圆角）
+    - 右上角三个迷你按钮：? 使用说明（悬浮展开）、⚙ 设置、✕ 关闭
+    - 整个卡片空白处按住即可拖动窗口（输入框/按钮上不触发）
+    - 说明气泡改成在窗口内展开（原来浮在卡片左侧，小窗口下会被裁掉），并精简了文案
+· 聊天页：标题和功能按钮整合进拖拽区
+    - 去掉原来单独一条 header：文件夹名 + 版本角标 + 在线状态 在左，
+      文件夹/昵称/删除记录/切换文件夹/设置 五个图标在中间，分隔线后是 ─ □ ✕
+    - 整条标题栏空白处按住即可拖动；双击 = 最大化 / 还原
+    - 最大化按钮图标随之切换（□ / 还原），接口返回 maximized 状态
+· 窗口层实现（win_ui.go）
+    - 新增 workArea()/modeSize()/placeCentered()：按工作区居中，窗口大于屏幕时自动夹紧
+    - 聊天页窗口样式加 WS_THICKFRAME：系统给一圈 3px 的拉伸边框
+      （网页是子窗口，会盖住父窗口的客户区，只靠 WM_NCHITTEST 拉边会失效）
+    - 另外仍保留自绘命中测试 resizeHit()：四边/四角 7px 内返回 HTLEFT/HTTOPRIGHT 等，
+      主页模式返回 0（不拦），最大化时不拦
+    - WM_GETMINMAXINFO 限制最小 780×520、最大不超过工作区（最大化不盖任务栏）
+    - 最大化/还原自己算：记下还原前的 rect，SetWindowPos 到工作区 / 回原位置
+    - DwmSetWindowAttribute(DWMWA_BORDER_COLOR) 把系统边框染成 #e4e8ee，与页面边框同色
+    - Win10 退化方案（DWM 圆角失败时）在 WM_SIZE 里重画圆角区域，最大化时取消裁剪
+    - /api/window 响应带上 {mode, maximized, rect}；/api/settings 增加 mode/maximized/rounded
+· 页面（web/index.html）
+    - body 增加 mode-home / mode-chat 两个类，CSS 按模式切布局；浏览器里自动隐藏窗口按钮
+    - setWinMode()/applyWinMode()：enterRoom 时切 chat，leaveRoom（切换文件夹）时切 home
+    - 设置面板在小窗口里也放得下（padding 收窄、内容超高时内部滚动）
+· 版本号 v2.3：exe 窗口标题、主页底部、聊天页角标、设置面板同步；文件夹改名 lanchat_exe_v2.3
+· 验证（本机 WebView2 运行时仍崩，窗口外观只能在用户机上最终确认）：
+    - LANCHAT_SHELLTEST=1 实测：home 380×408（客户区同为 380×408）、
+      chat 1040×720（客户区 1034×714，即系统边框 3px/边）、
+      max → 1920×1032（工作区，含任务栏 48px 的下边不覆盖）、再点还原回 1040×720
+    - 用 FindWindow+SendMessage(WM_NCHITTEST) 验证：聊天页四边返回 10/11/12/15、
+      左上 13、右下 17、中心 1；主页四边都返回 1（不可拉伸）
+    - SendMessage(WM_GETMINMAXINFO) 验证：MinTrackSize=780×520，MaxSize=工作区
+    - Chrome 无头 + CDP：?selftest 全绿（settings:true、errors 空）、
+      气泡左右分栏仍是 +286/+356 与 −349/−356；主页按 380×408 截图确认排版
+· 备份：改动前的 v2.2 整份留在 ..\backup\lanchat_exe_v2.2_备份_20261025
+  （项目根目录下的 lanchat_exe_v2.2 被系统占用暂时删不掉，内容与备份相同，可手动删除）
+
+--------------------------------------------------
+[v2.2]  2026-10-25   无边框窗口 + 托盘 + 设置面板（开机自启）
+· 窗口改成无边框（和 QQ 登录框一个思路：不要系统标题栏，内容自己画）：
+    - 去掉标题栏 / 边框 / 系统菜单，改成 WS_POPUP 固定尺寸窗口
+    - 尺寸 1040×720，按「屏幕工作区」居中并夹紧（小屏笔记本也不会超出屏幕）
+    - Win11 用 DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE) 让系统画圆角（抗锯齿）；
+      Win10 上这条调用失败，退回 CreateRoundRectRgn + SetWindowRgn 裁剪（边缘略糙）
+    - 顶部 36px 自绘窗口条：左侧空白按住可拖动，右侧「⚙ 设置 / ─ 最小化 / ✕ 关闭」
+    - 拖动由后端在 UI 线程里做（ReleaseCapture + WM_NCLBUTTONDOWN/HTCAPTION），
+      网页只发一个 /api/window?action=drag
+    - 接管 WM_CLOSE：Alt+F4 和点 ✕ 走同一套逻辑（收进托盘 / 退出）
+· 托盘图标（Shell_NotifyIcon，图标是代码画的 32×32，不依赖外部 ico 文件）：
+    - 双击图标恢复窗口；右键菜单：打开主界面 / 打开共享文件夹 / 退出
+    - 收进托盘时弹一次气泡「仍在后台运行，双击图标恢复」
+    - 顺手给窗口设了任务栏图标（WM_SETICON）
+· 新增设置面板（顶部 ⚙）：
+    - 开机自启：读写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run 的 LanChat 值，
+      写入的形式是 "exe 完整路径" --tray；开机启动时直接收进托盘不弹窗
+    - 点关闭按钮时：收进托盘（默认）/ 退出程序
+    - 显示当前共享文件夹（可一键打开）、版本号、配置文件位置
+    - 托盘创建失败时，已隐藏「双击托盘」提示并改写为「点 ✕ 会直接退出程序」
+· 新增接口：/api/settings（GET 读 / POST 写）、/api/window（min/show/hide/close/quit/drag）、
+  /api/open-cfg（打开配置目录）
+· 自检页 ?selftest 增加设置面板检查（settings 项），原有项全部保持通过
+· 验证方式（本机 WebView2 运行时坏掉，窗口效果只能在用户机上确认）：
+    - 新增 LANCHAT_SHELLTEST=1 外壳自检模式：不加载 WebView2，只建一个纯 Win32 空白窗口，
+      走同一套无边框/圆角/托盘代码。实测日志 dwm圆角=true、tray=true，
+      /api/window 的 hide→visible:false、show→true、min、drag、close(托盘模式)全部正常
+    - 开机自启：打开后注册表确有 LanChat 值（内容带 --tray），关闭后该值被删除
+    - 设置面板/窗口条/左右分栏：Chrome 无头 + CDP 截图与 ?selftest 全绿（0 报错）
+· 版本号 v2.2：窗口标题、主页底部、聊天页角标、设置面板同步；文件夹改名 lanchat_exe_v2.2
+· 备份：改动前的 v2.1 整份留在 ..\backup\lanchat_exe_v2.1_备份_20261025
+
+--------------------------------------------------
+[v2.1]  2026-10-25   主页收成小登录框 + 消息固定分两侧
+· 主页精简成一个 358px 宽的小卡片（形似 QQ 登录框，配色风格保持不变）：
+    - 原来那一长串小字说明全部收进右上角「?」，鼠标移上去才展开，默认不占位
+    - 说明面板浮在卡片左侧，不遮挡登录框；窗口窄于 792px 时自动改到卡片下方
+    - 页面上不再有独立的说明区块
+· 主页新增「继续上次：<文件夹名>」按钮：
+    - 从聊天页点「切换文件夹」回到主页后，一键回到刚才那个文件夹
+    - 原生模式读 %APPDATA%\LanChat\config.json 里记的路径，路径显示在按钮上（鼠标悬停看完整路径）
+    - 首次运行没有历史文件夹时，这个按钮不显示
+· 聊天页：本机消息固定贴右边、对方消息固定贴左边（和网页版一致），
+  头像各自靠屏幕边缘，气泡对齐方向明确（.msg.mine / .msg.other 分别定死）
+· 气泡功能按钮按发送方区分（鼠标悬停浮现，仍然不占布局空间）：
+    - 本机消息：复制 + 打开文件夹（文件本来就在共享文件夹里，不必再另存）
+    - 对方消息：复制 + 另存为…（保存到自己电脑）
+· 版本号 v2.1：exe 窗口标题、主页底部、聊天页角标三处同步；文件夹改名 lanchat_exe_v2.1
+· 稳定性（本版一并加上）：
+    - 页面每 3 秒给后端发一次心跳；若页面停止响应（例如 WebView2 运行时崩溃导致白屏），
+      程序 6 秒内自动改用系统浏览器打开同一个地址，不至于只剩一个点不动的白窗口
+    - /favicon.ico 改为返回一张合法的 1x1 PNG，不再回 404
+    - 新增调试开关：设环境变量 LANCHAT_DEBUG=1 会把每个接口请求和页面报错记到
+      %APPDATA%\LanChat\logs\api.log（默认关闭，正常使用不产生任何日志）
+    - 页面出错时会自动把错误信息回传给上面这个日志，方便排查「页面没反应」这类问题
+
+【实测记录 v2.1】（无头 Chrome + CDP 自动化，隔离的临时共享文件夹）
+· 自检 ?selftest：4 条消息全部渲染（本机 3 / 对方 1），每条气泡 2 个按钮，
+  本机=复制+打开文件夹、对方=复制+另存为，全部通过；errors 为空
+· 左右分栏（页面中线 540px）：本机气泡中心偏移 +286 / +356px，对方 -349 / -356px
+· 主页：卡片 358×379px，说明面板默认 visibility:hidden、悬浮后 visible，旧说明块已移除
+· 「继续上次」：自动进入 share → 点切换回主页（按钮显示「继续上次：share」）→
+  点按钮重新进入同一文件夹，历史 2 条消息仍在，无报错
+· 窄窗口 700×700：说明面板自动转到卡片下方，无横向滚动条
+· 原生 e2e：自动进入上次文件夹、发文字、粘贴图片、气泡按钮数 2，errbar 为空
+· 看门狗：故意让页面卡住 → 6 秒后日志出现「页面停止响应，改用系统浏览器」，浏览器正常打开页面
+· 已知问题（环境相关，非程序逻辑）：本机 WebView2 运行时（msedge.dll 155.0.4283.62）
+  在页面加载约 1 秒后让浏览器进程崩溃（Crashpad 记录 SubCode=0x80000003），
+  连一个 20 行的空白测试页也会崩 → 判定为运行时/系统环境问题。
+  表现：exe 窗口白屏；此时看门狗会自动改用浏览器打开，功能不受影响。
+  处理办法：重启电脑，或在「设置 → 应用」里修复/更新 Microsoft Edge WebView2 Runtime。
+
+--------------------------------------------------
+[v2.0]  2026-10-25   首个 exe 原生版
+· 打包为单文件 exe（6.18 MB，免安装）：Go + WebView2，双击即有独立窗口
+· 文件读写改为程序原生完成，拿到真实磁盘路径，因此：
+    - 去掉「手动填共享文件夹路径」的弹窗
+    - 去掉 lanchat:// 自定义协议 + .reg 注册 + PowerShell 脚本那一整套
+    - 「打开文件夹」现在真的会弹出资源管理器并选中文件（explorer /select）
+· 文件夹选择改用 Windows 系统对话框（SHBrowseForFolder）
+· 下次启动自动进入上次的文件夹，没有浏览器授权弹窗（上次路径存在 %APPDATA%\LanChat\config.json）
+· 页面通过 127.0.0.1 随机端口与后端通信，仅本机可访问；
+  所有路径都被限制在共享文件夹内（越权访问返回 400）
+· 分片写入改为服务端 O_TRUNC / O_APPEND，大文件内存占用恒定
+· 页面壳与 v1.6 完全一致，目录结构不变 → 可与网页版混用（一台 exe、一台 html）
+· 保留全部功能：文本/图片/文件互传、上传进度、复制/另存为/打开文件夹、
+  删除聊天记录（清空界面/彻底删除）、在线状态、Ctrl+V 粘贴、拖拽发送
+· 新增：重新编译.bat、tests\（CDP 自动化测试脚本）、本日志
+
+【实测记录 v2.0】
+· API：info / set-root / mkdir / list / read / write(trunc+append) / remove 全部通过
+· 越权读 C:\Windows\win.ini → 400 被拦
+· 原生页面 e2e：自动进入上次文件夹、发文字、粘贴图片、三个气泡按钮，0 报错
+· 双实例（隔离存储，模拟两台电脑）：B 发消息 → A 在 2 秒内收到，在线状态显示双方
+· GUI：窗口标题「局域网聊天 v2.0」，进程内存约 77 MB（WebView2 引擎另计约 300 MB）

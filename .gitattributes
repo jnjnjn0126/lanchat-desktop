@@ -1,0 +1,15 @@
+# 统一换行符，避免在 Linux/macOS 上 clone 下来脚本带 CRLF 跑不起来
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd 解析出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 给 Windows 用户直接双击看的文本，保持 CRLF
+*.txt text eol=crlf
+
+# 二进制，别做任何换行转换
+*.exe binary
+*.syso binary
+*.ico binary
+*.png binary
